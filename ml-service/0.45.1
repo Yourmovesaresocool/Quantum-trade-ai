@@ -1,0 +1,41 @@
+Collecting shap
+  Using cached shap-0.50.0-cp312-cp312-win_amd64.whl.metadata (25 kB)
+Requirement already satisfied: numpy>=2 in c:\users\om\ai-trading-bot\venv\lib\site-packages (from shap) (2.4.1)
+Requirement already satisfied: scipy in c:\users\om\ai-trading-bot\venv\lib\site-packages (from shap) (1.17.0)
+Requirement already satisfied: scikit-learn in c:\users\om\ai-trading-bot\venv\lib\site-packages (from shap) (1.8.0)
+Requirement already satisfied: pandas in c:\users\om\ai-trading-bot\venv\lib\site-packages (from shap) (3.0.0)
+Collecting tqdm>=4.27.0 (from shap)
+  Using cached tqdm-4.67.1-py3-none-any.whl.metadata (57 kB)
+Requirement already satisfied: packaging>20.9 in c:\users\om\ai-trading-bot\venv\lib\site-packages (from shap) (26.0)
+Collecting slicer==0.0.8 (from shap)
+  Using cached slicer-0.0.8-py3-none-any.whl.metadata (4.0 kB)
+Collecting numba>=0.54 (from shap)
+  Using cached numba-0.63.1-cp312-cp312-win_amd64.whl.metadata (3.0 kB)
+Collecting cloudpickle (from shap)
+  Downloading cloudpickle-3.1.2-py3-none-any.whl.metadata (7.1 kB)
+Requirement already satisfied: typing-extensions in c:\users\om\ai-trading-bot\venv\lib\site-packages (from shap) (4.15.0)
+Collecting llvmlite<0.47,>=0.46.0dev0 (from numba>=0.54->shap)
+  Using cached llvmlite-0.46.0-cp312-cp312-win_amd64.whl.metadata (5.1 kB)
+Collecting numpy>=2 (from shap)
+  Downloading numpy-2.3.5-cp312-cp312-win_amd64.whl.metadata (60 kB)
+Requirement already satisfied: colorama in c:\users\om\ai-trading-bot\venv\lib\site-packages (from tqdm>=4.27.0->shap) (0.4.6)
+Requirement already satisfied: python-dateutil>=2.8.2 in c:\users\om\ai-trading-bot\venv\lib\site-packages (from pandas->shap) (2.9.0.post0)
+Requirement already satisfied: tzdata in c:\users\om\ai-trading-bot\venv\lib\site-packages (from pandas->shap) (2025.3)
+Requirement already satisfied: joblib>=1.3.0 in c:\users\om\ai-trading-bot\venv\lib\site-packages (from scikit-learn->shap) (1.5.3)
+Requirement already satisfied: threadpoolctl>=3.2.0 in c:\users\om\ai-trading-bot\venv\lib\site-packages (from scikit-learn->shap) (3.6.0)
+Requirement already satisfied: six>=1.5 in c:\users\om\ai-trading-bot\venv\lib\site-packages (from python-dateutil>=2.8.2->pandas->shap) (1.17.0)
+Downloading shap-0.50.0-cp312-cp312-win_amd64.whl (549 kB)
+   ---------------------------------------- 549.3/549.3 kB 1.4 MB/s eta 0:00:00
+Using cached slicer-0.0.8-py3-none-any.whl (15 kB)
+Using cached numba-0.63.1-cp312-cp312-win_amd64.whl (2.8 MB)
+Downloading numpy-2.3.5-cp312-cp312-win_amd64.whl (12.8 MB)
+   ---------------------------------------- 12.8/12.8 MB 2.4 MB/s eta 0:00:00
+Using cached tqdm-4.67.1-py3-none-any.whl (78 kB)
+Downloading cloudpickle-3.1.2-py3-none-any.whl (22 kB)
+Using cached llvmlite-0.46.0-cp312-cp312-win_amd64.whl (38.1 MB)
+Installing collected packages: tqdm, slicer, numpy, llvmlite, cloudpickle, numba, shap
+  Attempting uninstall: numpy
+    Found existing installation: numpy 2.4.1
+    Uninstalling numpy-2.4.1:
+      Successfully uninstalled numpy-2.4.1
+Successfully installed cloudpickle-3.1.2 llvmlite-0.46.0 numba-0.63.1 numpy-2.3.5 shap-0.50.0 slicer-0.0.8 tqdm-4.67.1
