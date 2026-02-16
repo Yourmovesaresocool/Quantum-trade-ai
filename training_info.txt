@@ -1,0 +1,5 @@
+num_samples: 59650
+num_stocks: 49
+sequence_length: 60
+date_range: 2021-02-05 00:00:00 to 2026-02-04 00:00:00
+stocks: ['AAPL', 'ABBV', 'ADBE', 'AMD', 'AMZN', 'BA', 'BAC', 'BTC-USD', 'CMCSA', 'COST', 'CRM', 'CSCO', 'CVX', 'DIS', 'ETH-USD', 'F', 'GM', 'GOOGL', 'GS', 'HD', 'IBM', 'INTC', 'JNJ', 'JPM', 'LMT', 'LOW', 'MA', 'MCD', 'META', 'MS', 'MSFT', 'NFLX', 'NKE', 'NVDA', 'ORCL', 'PFE', 'PYPL', 'RTX', 'SBUX', 'T', 'TGT', 'TMO', 'TSLA', 'UNH', 'V', 'VZ', 'WFC', 'WMT', 'XOM']

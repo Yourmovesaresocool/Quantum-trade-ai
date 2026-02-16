@@ -75,7 +75,7 @@ except Exception as e:
 # Load CSV data
 print("\nLoading stock_data.csv...")
 try:
-    df = pd.read_csv('stock_data.csv')
+    df = pd.read_csv('real_stock_data.csv')
     print(f"✅ Loaded {len(df)} records from CSV")
 except FileNotFoundError:
     print("❌ stock_data.csv not found!")
