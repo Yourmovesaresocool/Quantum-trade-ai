@@ -1,0 +1,10 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+tensorflow>=2.19.0
+numpy>=1.24.0,<2.0.0
+pandas>=2.0.0
+scikit-learn>=1.6.1
+pydantic==2.10.5
+python-multipart==0.0.20
+shap>=0.45.1
+gunicorn==23.0.0

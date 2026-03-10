@@ -1,0 +1,12 @@
+{
+  "model_type": "LSTM",
+  "sequence_length": 60,
+  "num_features": 1,
+  "total_samples": 59650,
+  "epochs_trained": 12,
+  "val_loss": 0.001225398969836533,
+  "val_mae": 0.026471436023712158,
+  "real_mae": 1331.56705002315,
+  "r2_score": 0.8336698813351296,
+  "tensorflow_version": "2.19.0"
+}
