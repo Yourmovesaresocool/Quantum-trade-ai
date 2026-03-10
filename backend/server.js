@@ -52,7 +52,7 @@ app.use(express.json());
 // CONFIGURATION
 // ============================================
 
-const ML_SERVICE_URL = process.env.ML_SERVICE_URL || 'https://quantum-ml-service.onrender.com';
+const ML_SERVICE_URL = 'https://quantum-ml-service.onrender.com';
 
 console.log('\n' + '='.repeat(60));
 console.log('🚀 QUANTUM TRADE BACKEND SERVER');
