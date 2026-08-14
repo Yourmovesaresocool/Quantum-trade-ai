@@ -40,8 +40,7 @@ backend/dist/
 ml-service/dist/
 
 # ML Models (if large)
-*.h5
-*.pkl
+
 *.pth
 *.ckpt
 
@@ -71,3 +70,5 @@ logs/
 Thumbs.db
 *.bak
 .cache/
+
+data/scripts/*.npy

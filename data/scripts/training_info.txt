@@ -1,0 +1,9 @@
+num_samples: 54708
+num_stocks: 47
+sequence_length: 90
+num_features: 7
+feature_names: ['close', 'volume', 'rsi', 'macd_hist', 'high', 'low', 'volume_ratio']
+target_type: next_day_return
+date_range: 2021-07-19 00:00:00 to 2026-07-16 00:00:00
+stocks: ['AAPL', 'ABBV', 'ADBE', 'AMD', 'AMZN', 'BA', 'BAC', 'CMCSA', 'COST', 'CRM', 'CSCO', 'CVX', 'DIS', 'F', 'GM', 'GOOGL', 'GS', 'HD', 'IBM', 'INTC', 'JNJ', 'JPM', 'LMT', 'LOW', 'MA', 'MCD', 'META', 'MS', 'MSFT', 'NFLX', 'NKE', 'NVDA', 'ORCL', 'PFE', 'PYPL', 'RTX', 'SBUX', 'T', 'TGT', 'TMO', 'TSLA', 'UNH', 'V', 'VZ', 'WFC', 'WMT', 'XOM']
+skipped_symbols: []

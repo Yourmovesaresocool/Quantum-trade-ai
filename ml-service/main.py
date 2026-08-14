@@ -1,38 +1,64 @@
 """
-QUANTUM TRADE ML SERVICE - LSTM EDITION 
+QUANTUM TRADE ML SERVICE - LSTM ONLY, MULTIVARIATE (v5)
+
+CHANGES FROM v4 (single-feature 'recent_prices'):
+  - /predict now expects full OHLCV bars, not just a list of close prices.
+    This is required because the model now needs 7 features per day
+    (close, volume, rsi, macd_hist, high, low, volume_ratio) to match
+    what it was trained on in prepare_data.py v5.
+  - RSI/MACD/volume-ratio are computed HERE using the exact same rolling
+    formulas as prepare_data.py, so training and live inference stay
+    consistent (this consistency is the single most important thing to
+    get right — a mismatch here would silently corrupt every prediction).
+  - price_scalers.pkl scalers are now fit on 7 columns, not 1 — loading
+    and usage code is unchanged, only the data shape going through it.
+  - Requires MORE than 90 bars from the caller (90 + warmup buffer for
+    RSI/MACD/volume-ratio, same as training) — see MIN_BARS_REQUIRED.
 """
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import numpy as np
+import pandas as pd
 from typing import List, Dict, Optional
 import uvicorn
 import os
 import pickle
 import json
+import logging
 from datetime import datetime
 
-# Try to import TensorFlow (for LSTM)
 try:
     import tensorflow as tf
     from tensorflow import keras
     LSTM_AVAILABLE = True
-    print("✅ TensorFlow available - LSTM model can be loaded")
 except ImportError:
     LSTM_AVAILABLE = False
-    print("⚠️  TensorFlow not available - using fallback prediction")
-    print("   Install with: pip install tensorflow")
+
+os.makedirs('logs', exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler('logs/ml_service.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+if not LSTM_AVAILABLE:
+    logger.warning("TensorFlow not installed — predictions unavailable until it is. Install with: pip install tensorflow")
 
 app = FastAPI(
-    title="Quantum Trade ML Service - LSTM Edition",
-    description="AI-powered stock prediction with LSTM deep learning",
-    version="2.0.0"
+    title="Quantum Trade ML Service - LSTM Only, Multivariate",
+    description="LSTM-only stock prediction using 7 daily features (no fallback math models)",
+    version="5.0.0"
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -42,8 +68,16 @@ app.add_middleware(
 # REQUEST/RESPONSE MODELS
 # ============================================
 
+class Bar(BaseModel):
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+
 class PredictRequest(BaseModel):
-    recent_prices: List[float]
+    symbol: str
+    bars: List[Bar]  # oldest-first, same order as the DB query
 
 class TradeRequest(BaseModel):
     balance: float
@@ -55,562 +89,317 @@ class TradeRequest(BaseModel):
     symbol: str
 
 # ============================================
-# GLOBAL VARIABLES
+# GLOBAL STATE
 # ============================================
 
 lstm_model = None
-price_scaler = None
+price_scalers = None   # dict: {symbol: scaler}, now fit on 7 columns
 lstm_metadata = None
 
+MODEL_PATH = 'lstm_model_final.h5'
+SCALERS_PATH = 'price_scalers.pkl'
+METADATA_PATH = 'lstm_metadata.json'
+
+FEATURE_NAMES = ['close', 'volume', 'rsi', 'macd_hist', 'high', 'low', 'volume_ratio']
+SEQUENCE_LENGTH_DEFAULT = 90
+WARMUP_DEFAULT = 40
+MIN_BARS_REQUIRED = SEQUENCE_LENGTH_DEFAULT + WARMUP_DEFAULT  # 130 — matches prepare_data.py's MIN_ROWS_REQUIRED
+
 # ============================================
-# LOAD LSTM MODEL (FIXED!)
+# FEATURE ENGINEERING — MUST MATCH prepare_data.py EXACTLY
 # ============================================
 
-def load_lstm_model():
-    """
-    Load trained LSTM model from disk
-    Returns True if successful, False otherwise
-    """
-    global lstm_model, price_scaler, lstm_metadata
-    
-    model_path = 'lstm_stock_model.h5'
-    scaler_path = 'lstm_scaler.pkl'
-    metadata_path = 'lstm_metadata.json'
-    
+def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    delta = close.diff()
+    gains = delta.clip(lower=0)
+    losses = -delta.clip(upper=0)
+    avg_gain = gains.rolling(window=period, min_periods=period).mean()
+    avg_loss = losses.rolling(window=period, min_periods=period).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    rsi = rsi.fillna(50.0)
+    rsi[avg_loss == 0] = 100.0
+    return rsi
+
+
+def compute_macd_histogram(close: pd.Series, fast: int = 12, slow: int = 26) -> pd.Series:
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line * 0.2
+    histogram = macd_line - signal_line
+    histogram.iloc[:slow] = 0.0
+    return histogram
+
+
+def compute_volume_ratio(volume: pd.Series, period: int = 20) -> pd.Series:
+    avg_volume = volume.rolling(window=period, min_periods=period).mean()
+    ratio = volume / avg_volume.replace(0, np.nan)
+    return ratio.fillna(1.0)
+
+
+def build_feature_matrix(bars: List[Bar]) -> np.ndarray:
+    """Builds the (n_bars, 7) RAW (unscaled) feature matrix from OHLCV
+    bars — same column order and formulas as prepare_data.py."""
+    df = pd.DataFrame([b.dict() for b in bars])
+
+    rsi = compute_rsi(df['close'])
+    macd_hist = compute_macd_histogram(df['close'])
+    volume_ratio = compute_volume_ratio(df['volume'])
+
+    feature_df = pd.DataFrame({
+        'close': df['close'].values,
+        'volume': df['volume'].values,
+        'rsi': rsi.values,
+        'macd_hist': macd_hist.values,
+        'high': df['high'].values,
+        'low': df['low'].values,
+        'volume_ratio': volume_ratio.values,
+    })
+    return feature_df.values
+
+# ============================================
+# LOAD LSTM MODEL
+# ============================================
+
+def load_lstm_model() -> bool:
+    global lstm_model, price_scalers, lstm_metadata
+
     if not LSTM_AVAILABLE:
-        print("\n⚠️  TensorFlow not installed!")
-        print("   Install with: pip install tensorflow")
-        print("   Using ensemble fallback methods\n")
+        logger.error("TensorFlow not installed — cannot load LSTM.")
         return False
-    
+
+    if not os.path.exists(MODEL_PATH):
+        logger.error(f"LSTM model not found at '{MODEL_PATH}'. Expected files: {MODEL_PATH}, {SCALERS_PATH}, {METADATA_PATH}")
+        return False
+
+    if not os.path.exists(SCALERS_PATH):
+        logger.error(f"Scaler file not found at '{SCALERS_PATH}'.")
+        return False
+
     try:
-        # Load LSTM model
-        if os.path.exists(model_path):
-            print(f"\n📂 Loading LSTM model from {model_path}...")
-            
-            # 🔥 FIX: Load with compile=False to avoid metric deserialization error
-            lstm_model = keras.models.load_model(model_path, compile=False)
-            print("✅ LSTM model loaded successfully (compile=False)!")
-            print(f"   Model size: {os.path.getsize(model_path) / (1024*1024):.1f} MB")
-            
-            # Load scaler
-            if os.path.exists(scaler_path):
-                with open(scaler_path, 'rb') as f:
-                    price_scaler = pickle.load(f)
-                print("✅ Price scaler loaded!")
-            else:
-                print(f"⚠️  Scaler not found at {scaler_path}")
-                lstm_model = None
-                return False
-            
-            # Load metadata
-            if os.path.exists(metadata_path):
-                with open(metadata_path, 'r') as f:
-                    lstm_metadata = json.load(f)
-                print("✅ Model metadata loaded!")
-                print(f"   Model type: {lstm_metadata.get('model_type', 'LSTM')}")
-                print(f"   Sequence length: {lstm_metadata.get('sequence_length', 60)}")
-                print(f"   Training samples: {lstm_metadata.get('total_samples', 'N/A'):,}")
-                print(f"   R² Score: {lstm_metadata.get('r2_score', 0)*100:.2f}%")
-                print(f"   MAE: ${lstm_metadata.get('real_mae', 'N/A'):.2f}")
-            
-            return True
-            
+        logger.info(f"Loading LSTM model from {MODEL_PATH}...")
+        lstm_model = keras.models.load_model(MODEL_PATH, compile=False)
+        logger.info(f"LSTM model loaded ({os.path.getsize(MODEL_PATH) / (1024*1024):.1f} MB)")
+
+        with open(SCALERS_PATH, 'rb') as f:
+            price_scalers = pickle.load(f)
+        logger.info(f"Loaded {len(price_scalers)} per-symbol scalers")
+
+        if os.path.exists(METADATA_PATH):
+            with open(METADATA_PATH, 'r') as f:
+                lstm_metadata = json.load(f)
+            logger.info(f"Metadata: seq_len={lstm_metadata.get('sequence_length')}, "
+                        f"features={lstm_metadata.get('num_features')}, r2={lstm_metadata.get('r2_score')}")
         else:
-            print(f"\n⚠️  LSTM model not found at {model_path}")
-            print("   Expected files:")
-            print(f"   - {model_path}")
-            print(f"   - {scaler_path}")
-            print(f"   - {metadata_path}")
-            print("\n   Using ensemble fallback methods")
-            print("   To use LSTM:")
-            print("   1. Train model in Google Colab")
-            print("   2. Download the 3 files above")
-            print("   3. Copy them to ml-service/ folder")
-            print("   4. Restart this service\n")
-            return False
-            
+            logger.warning(f"No metadata file at '{METADATA_PATH}' — using defaults")
+            lstm_metadata = {"sequence_length": SEQUENCE_LENGTH_DEFAULT, "num_features": len(FEATURE_NAMES)}
+
+        return True
+
     except Exception as e:
-        print(f"\n❌ Error loading LSTM model: {e}")
-        print("   Using ensemble fallback methods\n")
+        logger.error(f"Failed to load LSTM model: {e}", exc_info=True)
         lstm_model = None
-        price_scaler = None
+        price_scalers = None
         lstm_metadata = None
         return False
 
-# ============================================
-# LSTM PREDICTION
-# ============================================
 
-def predict_with_lstm(prices: np.ndarray) -> Optional[float]:
+def predict_with_lstm(bars: List[Bar], symbol: Optional[str]) -> float:
     """
-    Predict next price using LSTM deep learning model
-    
-    Args:
-        prices: Array of historical prices
-        
-    Returns:
-        Predicted price or None if model unavailable
+    Predict next-day RETURN using the LSTM model ONLY, then convert it to
+    a dollar price using the current (most recent) close.
+    Raises ValueError with a specific reason on any failure.
     """
-    if lstm_model is None or price_scaler is None:
-        return None
-    
-    try:
-        # Get sequence length from metadata
-        seq_length = lstm_metadata.get('sequence_length', 60) if lstm_metadata else 60
-        
-        # Need at least seq_length prices
-        if len(prices) < seq_length:
-            print(f"⚠️  LSTM needs {seq_length} prices, got {len(prices)}")
-            return None
-        
-        # Take last seq_length prices
-        recent_prices = prices[-seq_length:]
-        
-        # Normalize using trained scaler
-        normalized = price_scaler.transform(recent_prices.reshape(-1, 1)).flatten()
-        
-        # Reshape for LSTM: (batch_size=1, timesteps=seq_length, features=1)
-        X = normalized.reshape(1, seq_length, 1)
-        
-        # Predict (silent mode)
-        pred_normalized = lstm_model.predict(X, verbose=0)[0][0]
-        
-        # Denormalize back to real price
-        pred_price = price_scaler.inverse_transform([[pred_normalized]])[0][0]
-        
-        return float(pred_price)
-        
-    except Exception as e:
-        print(f"❌ LSTM prediction error: {e}")
-        return None
+    if lstm_model is None or price_scalers is None:
+        raise ValueError("LSTM model is not loaded on this service.")
+
+    seq_length = lstm_metadata.get('sequence_length', SEQUENCE_LENGTH_DEFAULT)
+    min_bars = seq_length + WARMUP_DEFAULT
+
+    if len(bars) < min_bars:
+        raise ValueError(f"Need at least {min_bars} bars (90-day window + indicator warmup), got {len(bars)}.")
+
+    if symbol and symbol in price_scalers:
+        scaler = price_scalers[symbol]
+    else:
+        raise ValueError(
+            f"No trained scaler for symbol '{symbol}'. "
+            f"Available symbols: {list(price_scalers.keys())[:5]}..."
+        )
+
+    raw_features = build_feature_matrix(bars)          # (n_bars, 7), warmup included
+    normalized = scaler.transform(raw_features)          # same 7-column scaler as training
+    recent_window = normalized[-seq_length:]              # take the last 90 rows AFTER warmup
+
+    X = recent_window.reshape(1, seq_length, recent_window.shape[1])
+
+    predicted_return = float(lstm_model.predict(X, verbose=0)[0][0])
+
+    current_price = float(bars[-1].close)
+    predicted_price = current_price * (1 + predicted_return)
+
+    return predicted_price
 
 # ============================================
-# ENSEMBLE FALLBACK PREDICTION
-# ============================================
-
-def predict_with_ensemble(prices: np.ndarray) -> float:
-    """
-    Fallback prediction using ensemble of traditional methods:
-    - Linear Regression
-    - Simple Moving Average (SMA)
-    - Exponential Moving Average (EMA)
-    
-    Args:
-        prices: Array of historical prices
-        
-    Returns:
-        Predicted price
-    """
-    
-    # 1. Linear Regression Prediction
-    x = np.arange(len(prices[-10:]))
-    coeffs = np.polyfit(x, prices[-10:], 1)
-    linear_pred = prices[-1] + coeffs[0]
-    
-    # 2. SMA Prediction
-    sma_10 = np.mean(prices[-10:])
-    sma_5 = np.mean(prices[-5:])
-    sma_pred = sma_5 + (sma_5 - sma_10)
-    
-    # 3. EMA Prediction
-    def ema(data, period=10):
-        multiplier = 2 / (period + 1)
-        ema_val = data[0]
-        for price in data[1:]:
-            ema_val = (price * multiplier) + (ema_val * (1 - multiplier))
-        return ema_val
-    
-    ema_10 = ema(prices[-10:])
-    ema_5 = ema(prices[-5:])
-    ema_pred = ema_5 + (ema_5 - ema_10)
-    
-    # Weighted average based on volatility
-    volatility = np.std(prices[-10:])
-    if volatility > prices[-1] * 0.05:  # High volatility
-        weights = [0.3, 0.35, 0.35]
-    else:  # Low volatility
-        weights = [0.5, 0.25, 0.25]
-    
-    # Combine predictions
-    prediction = (
-        linear_pred * weights[0] +
-        sma_pred * weights[1] +
-        ema_pred * weights[2]
-    )
-    
-    return float(prediction)
-
-# ============================================
-# TECHNICAL INDICATORS
+# TECHNICAL INDICATORS FOR /trade_decision (unchanged — request-time only)
 # ============================================
 
 def calculate_rsi(prices: np.ndarray, period: int = 14) -> float:
-    """Calculate Relative Strength Index"""
     if len(prices) < period + 1:
         return 50.0
-    
     deltas = np.diff(prices)
     gains = np.where(deltas > 0, deltas, 0)
     losses = np.where(deltas < 0, -deltas, 0)
-    
     avg_gain = np.mean(gains[-period:])
     avg_loss = np.mean(losses[-period:])
-    
     if avg_loss == 0:
         return 100.0
-    
     rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return float(rsi)
+    return float(100 - (100 / (1 + rs)))
+
 
 def calculate_macd(prices: np.ndarray) -> Dict[str, float]:
-    """Calculate MACD indicator"""
     if len(prices) < 26:
         return {"macd": 0.0, "signal": 0.0, "histogram": 0.0}
-    
-    # EMA calculation
+
     def ema(data, period):
         multiplier = 2 / (period + 1)
-        ema_val = data[0]
+        val = data[0]
         for price in data[1:]:
-            ema_val = (price * multiplier) + (ema_val * (1 - multiplier))
-        return ema_val
-    
+            val = (price * multiplier) + (val * (1 - multiplier))
+        return val
+
     ema_12 = ema(prices[-26:], 12)
     ema_26 = ema(prices[-26:], 26)
     macd_line = ema_12 - ema_26
-    
-    # Signal line (9-day EMA of MACD)
-    signal_line = macd_line * 0.2  # Simplified
-    histogram = macd_line - signal_line
-    
-    return {
-        "macd": float(macd_line),
-        "signal": float(signal_line),
-        "histogram": float(histogram)
-    }
+    signal_line = macd_line * 0.2
+    return {"macd": float(macd_line), "signal": float(signal_line), "histogram": float(macd_line - signal_line)}
+
 
 def calculate_bollinger_bands(prices: np.ndarray, period: int = 20) -> Dict[str, float]:
-    """Calculate Bollinger Bands"""
     if len(prices) < period:
         return {"upper": 0.0, "middle": 0.0, "lower": 0.0}
-    
     sma = np.mean(prices[-period:])
     std = np.std(prices[-period:])
-    
-    return {
-        "upper": float(sma + 2 * std),
-        "middle": float(sma),
-        "lower": float(sma - 2 * std)
-    }
+    return {"upper": float(sma + 2 * std), "middle": float(sma), "lower": float(sma - 2 * std)}
 
 # ============================================
-# AI REASONING GENERATION
-# ============================================
-
-def generate_reasoning(
-    action: str, 
-    symbol: str, 
-    rsi: float, 
-    trend: float, 
-    volatility: float, 
-    price_change: float,
-    macd: Dict[str, float]
-) -> str:
-    """
-    Generate human-readable explanation for trading decision
-    """
-    parts = []
-    
-    # Main action reason
-    if action == "BUY":
-        parts.append(f"📈 {symbol} shows strong buying opportunity")
-        if rsi < 30:
-            parts.append("Stock appears oversold (RSI < 30) - potential rebound")
-        elif trend > 5:
-            parts.append(f"Bullish trend confirmed (+{trend:.1f}% momentum)")
-        if macd["histogram"] > 0:
-            parts.append("MACD histogram positive - upward momentum")
-            
-    elif action == "SELL":
-        parts.append(f"📉 {symbol} showing sell signals")
-        if rsi > 70:
-            parts.append("Stock overbought (RSI > 70) - correction likely")
-        elif trend < -5:
-            parts.append(f"Bearish trend confirmed ({trend:.1f}% momentum)")
-        if macd["histogram"] < 0:
-            parts.append("MACD histogram negative - downward pressure")
-            
-    else:  # HOLD
-        parts.append(f"⏸️ {symbol} in neutral zone - hold current position")
-        parts.append(f"RSI at {rsi:.1f} (neutral range)")
-    
-    # Volatility warning
-    if volatility > 10:
-        parts.append(f"⚠️ High volatility ({volatility:.1f}σ) - increased risk")
-    
-    # Recent momentum
-    if abs(price_change) > 3:
-        direction = "upward" if price_change > 0 else "downward"
-        parts.append(f"Recent {direction} momentum ({price_change:+.2f}%)")
-    
-    return ". ".join(parts) + "."
-
-# ============================================
-# API ENDPOINTS
+# ENDPOINTS
 # ============================================
 
 @app.get("/")
 async def root():
-    """Root endpoint with service info"""
-    model_status = "LSTM Deep Learning" if lstm_model is not None else "Ensemble (Fallback)"
-    
     return {
         "service": "Quantum Trade ML Service",
-        "version": "2.0.0",
+        "version": "5.0.0",
         "status": "active",
-        "model": model_status,
-        "lstm_available": lstm_model is not None,
+        "model": "LSTM (multivariate, no fallback)",
+        "lstm_loaded": lstm_model is not None,
         "tensorflow_installed": LSTM_AVAILABLE,
-        "features": [
-            "LSTM Deep Learning Predictions" if lstm_model else "Ensemble Predictions",
-            "Technical Indicators (RSI, MACD, Bollinger)",
-            "AI Reasoning",
-            "Trading Signals"
-        ],
-        "endpoints": {
-            "health": "/health",
-            "predict": "/predict (POST)",
-            "trade": "/trade_decision (POST)",
-            "docs": "/docs"
-        }
+        "feature_names": FEATURE_NAMES,
     }
+
 
 @app.get("/health")
 async def health():
-    """Health check endpoint"""
     return {
-        "status": "healthy",
-        "service": "ml-lstm",
+        "status": "healthy" if lstm_model is not None else "degraded",
+        "lstm_loaded": lstm_model is not None,
+        "tensorflow_available": LSTM_AVAILABLE,
+        "metadata": lstm_metadata or {},
         "timestamp": datetime.now().isoformat(),
-        "model": {
-            "type": "LSTM" if lstm_model is not None else "Ensemble",
-            "loaded": lstm_model is not None,
-            "tensorflow_available": LSTM_AVAILABLE,
-            "metadata": lstm_metadata if lstm_metadata else {}
-        }
     }
+
 
 @app.post("/predict")
 async def predict(request: PredictRequest):
-    """
-    Predict next day's stock price
-    
-    Uses LSTM model if available, otherwise falls back to ensemble methods
-    """
+    if len(request.bars) < 10:
+        raise HTTPException(status_code=400, detail="Need at least 10 bars for prediction")
+
     try:
-        prices = np.array(request.recent_prices)
-        
-        if len(prices) < 10:
-            raise HTTPException(
-                status_code=400, 
-                detail="Need at least 10 price points for prediction"
-            )
-        
-        # Try LSTM first
-        lstm_prediction = None
-        if lstm_model is not None:
-            lstm_prediction = predict_with_lstm(prices)
-        
-        # Fallback ensemble prediction
-        ensemble_prediction = predict_with_ensemble(prices)
-        
-        # Determine final prediction and confidence
-        if lstm_prediction is not None:
-            final_prediction = lstm_prediction
-            model_used = "LSTM Deep Learning"
-            # Use R² score from metadata if available
-            confidence = lstm_metadata.get('r2_score', 0.75) if lstm_metadata else 0.75
-        else:
-            final_prediction = ensemble_prediction
-            model_used = "Hybrid Ensemble (Linear + SMA + EMA)"
-            
-            # Calculate confidence based on volatility
-            volatility = np.std(prices[-10:]) / np.mean(prices[-10:])
-            confidence = max(0.5, min(0.85, 0.7 - volatility))
-        
-        # Add small random variance to prevent identical predictions
-        variance = np.random.uniform(-0.005, 0.005)
-        final_prediction = final_prediction * (1 + variance)
-        
-        # Calculate technical indicators
-        rsi = calculate_rsi(prices)
-        macd = calculate_macd(prices)
-        bollinger = calculate_bollinger_bands(prices)
-        
-        return {
-            "predicted_price": float(final_prediction),
-            "confidence": float(confidence),
-            "model": model_used,
-            "components": {
-                "lstm_prediction": float(lstm_prediction) if lstm_prediction else None,
-                "ensemble_prediction": float(ensemble_prediction),
-                "current_price": float(prices[-1]),
-                "price_change": float(((final_prediction - prices[-1]) / prices[-1]) * 100)
-            },
-            "indicators": {
-                "rsi": float(rsi),
-                "macd": macd,
-                "bollinger_bands": bollinger
-            },
-            "metadata": {
-                "timestamp": datetime.now().isoformat(),
-                "data_points": len(prices)
-            }
-        }
-    
-    except HTTPException:
-        raise
+        predicted_price = predict_with_lstm(request.bars, request.symbol)
+    except ValueError as e:
+        logger.warning(f"Prediction unavailable for {request.symbol}: {e}")
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Prediction error: {str(e)}")
+        logger.error(f"Unexpected prediction error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Prediction failed")
+
+    closes = np.array([b.close for b in request.bars])
+    rsi = calculate_rsi(closes)
+    macd = calculate_macd(closes)
+    bollinger = calculate_bollinger_bands(closes)
+
+    return {
+        "predicted_price": predicted_price,
+        "confidence": lstm_metadata.get('r2_score', None) if lstm_metadata else None,
+        "directional_accuracy": lstm_metadata.get('directional_accuracy', None) if lstm_metadata else None,
+        "model": "LSTM",
+        "current_price": float(closes[-1]),
+        "price_change_pct": float(((predicted_price - closes[-1]) / closes[-1]) * 100),
+        "indicators": {"rsi": rsi, "macd": macd, "bollinger_bands": bollinger},
+        "metadata": {"timestamp": datetime.now().isoformat(), "bars_received": len(request.bars)},
+    }
+
 
 @app.post("/trade_decision")
 async def trade_decision(request: TradeRequest):
-    """
-    Generate BUY/SELL/HOLD trading decision with AI reasoning
-    """
     try:
-        # Calculate individual signals
         price_signal = 1 if request.price_change > 0.02 else (-1 if request.price_change < -0.02 else 0)
         trend_signal = 1 if request.trend > 0.05 else (-1 if request.trend < -0.05 else 0)
         vol_signal = -1 if request.volatility > 10 else 0
-        
-        # Estimate RSI from trend and price change
-        estimated_rsi = 50 + (request.price_change * 5) + (request.trend * 2)
-        estimated_rsi = max(0, min(100, estimated_rsi))
+
+        estimated_rsi = max(0, min(100, 50 + (request.price_change * 5) + (request.trend * 2)))
         rsi_signal = -1 if estimated_rsi > 70 else (1 if estimated_rsi < 30 else 0)
-        
-        # Estimate MACD
-        macd = {
-            "macd": request.trend * 0.5,
-            "signal": request.trend * 0.3,
-            "histogram": request.trend * 0.2
-        }
+
+        macd = {"macd": request.trend * 0.5, "signal": request.trend * 0.3, "histogram": request.trend * 0.2}
         macd_signal = 1 if macd["histogram"] > 0.5 else (-1 if macd["histogram"] < -0.5 else 0)
-        
-        # Weighted total signal
-        total_signal = (
-            price_signal * 1.5 +
-            trend_signal * 2.0 +
-            vol_signal * 0.5 +
-            rsi_signal * 1.0 +
-            macd_signal * 1.0
-        )
-        
-        # Make decision
+
+        total_signal = price_signal * 1.5 + trend_signal * 2.0 + vol_signal * 0.5 + rsi_signal * 1.0 + macd_signal * 1.0
+
         if total_signal >= 2.5:
-            action = "BUY"
-            confidence = min(0.92, 0.65 + (total_signal * 0.08))
+            action, confidence = "BUY", min(0.92, 0.65 + (total_signal * 0.08))
         elif total_signal <= -2.5:
-            action = "SELL"
-            confidence = min(0.92, 0.65 + (abs(total_signal) * 0.08))
+            action, confidence = "SELL", min(0.92, 0.65 + (abs(total_signal) * 0.08))
         else:
-            action = "HOLD"
-            confidence = 0.50 + (abs(total_signal) * 0.05)
-        
-        # Generate AI reasoning
-        reason = generate_reasoning(
-            action=action,
-            symbol=request.symbol,
-            rsi=estimated_rsi,
-            trend=request.trend,
-            volatility=request.volatility,
-            price_change=request.price_change,
-            macd=macd
-        )
-        
-        # Calculate position sizing (if buying)
+            action, confidence = "HOLD", 0.50 + (abs(total_signal) * 0.05)
+
         shares_to_trade = 0
         if action == "BUY" and request.balance > 0:
-            # Risk 10% of balance
-            max_investment = request.balance * 0.10
-            shares_to_trade = int(max_investment / request.current_price)
+            shares_to_trade = int((request.balance * 0.10) / request.current_price)
         elif action == "SELL" and request.shares > 0:
-            # Sell 50% of position
             shares_to_trade = int(request.shares * 0.50)
-        
+
         return {
             "action": action,
             "confidence": float(confidence),
-            "reason": reason,
             "shares": max(1, shares_to_trade),
-            "indicators": {
-                "rsi": float(estimated_rsi),
-                "trend_strength": float(request.trend),
-                "volatility_level": float(request.volatility),
-                "signal_score": float(total_signal),
-                "macd": macd
-            },
-            "signals": {
-                "price": price_signal,
-                "trend": trend_signal,
-                "volatility": vol_signal,
-                "rsi": rsi_signal,
-                "macd": macd_signal,
-                "total": float(total_signal)
-            },
-            "metadata": {
-                "timestamp": datetime.now().isoformat(),
-                "model": "LSTM" if lstm_model else "Ensemble",
-                "symbol": request.symbol
-            }
+            "indicators": {"rsi": float(estimated_rsi), "trend_strength": request.trend, "volatility_level": request.volatility, "signal_score": total_signal, "macd": macd},
+            "metadata": {"timestamp": datetime.now().isoformat(), "symbol": request.symbol},
         }
-    
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Trade decision error: {str(e)}")
+        logger.error(f"Trade decision error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Trade decision error")
 
 # ============================================
-# STARTUP EVENT
+# STARTUP
 # ============================================
 
 @app.on_event("startup")
 async def startup_event():
-    """Load models on startup"""
-    print("\n" + "=" * 70)
-    print("🚀 QUANTUM TRADE ML SERVICE - LSTM EDITION")
-    print("=" * 70)
-    
-    # Try to load LSTM model
-    lstm_loaded = load_lstm_model()
-    
-    print("=" * 70)
-    print(f"✅ Service ready!")
-    print(f"   Model: {'LSTM Deep Learning' if lstm_loaded else 'Ensemble Fallback'}")
-    print(f"   TensorFlow: {'Available' if LSTM_AVAILABLE else 'Not installed'}")
-    print("=" * 70 + "\n")
-
-# ============================================
-# EXPORT FOR VERCEL
-# ============================================
+    logger.info("=" * 70)
+    logger.info("QUANTUM TRADE ML SERVICE - LSTM ONLY, MULTIVARIATE - STARTING")
+    logger.info("=" * 70)
+    loaded = load_lstm_model()
+    if not loaded:
+        logger.error(
+            f"LSTM model FAILED to load. /predict will return 503 until "
+            f"{MODEL_PATH} and {SCALERS_PATH} are present in this directory."
+        )
+    logger.info("=" * 70)
 
 handler = app
 
-# ============================================
-# LOCAL DEVELOPMENT
-# ============================================
-
 if __name__ == "__main__":
-    print("\n" + "=" * 70)
-    print("🚀 STARTING ML SERVICE")
-    print("=" * 70)
-    print("🌐 Server: http://localhost:8000")
-    print("📚 Docs: http://localhost:8000/docs")
-    print("=" * 70 + "\n")
-    
-    uvicorn.run(
-        app, 
-        host="0.0.0.0", 
-        port=8000,
-        log_level="info"
-    )
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")

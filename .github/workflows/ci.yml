@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  backend-tests:
+    name: Backend tests (Jest + Supertest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci
+      - run: npm test
+        env:
+          # Dummy values so server.js's startup env-check and JWT_SECRET
+          # requirement pass in CI — auth.test.js only exercises
+          # validation paths that never touch a real database.
+          JWT_SECRET: ci-test-secret-not-for-production
+          DATABASE_URL: postgresql://ci:ci@localhost:5432/ci_placeholder
+          NODE_ENV: test
+
+  frontend-tests:
+    name: Frontend tests (React Testing Library)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: CI=true npm test -- --watchAll=false

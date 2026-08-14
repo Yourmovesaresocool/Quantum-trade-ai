@@ -1,12 +1,21 @@
 {
   "model_type": "LSTM",
-  "sequence_length": 60,
-  "num_features": 1,
-  "total_samples": 59650,
-  "epochs_trained": 12,
-  "val_loss": 0.001225398969836533,
-  "val_mae": 0.026471436023712158,
-  "real_mae": 1331.56705002315,
-  "r2_score": 0.8336698813351296,
-  "tensorflow_version": "2.19.0"
+  "target_type": "next_day_return",
+  "sequence_length": 90,
+  "num_features": 7,
+  "feature_names": [
+    "close",
+    "volume",
+    "rsi",
+    "macd_hist",
+    "high",
+    "low",
+    "volume_ratio"
+  ],
+  "total_samples": 54708,
+  "r2_score": 0.0006407066255024185,
+  "mae_return_scale": 0.014655630733029957,
+  "directional_accuracy": 0.5014153958542599,
+  "naive_zero_return_r2": -0.0010854806749185375,
+  "trained_at": "2026-07-19T06:54:32.376722"
 }
