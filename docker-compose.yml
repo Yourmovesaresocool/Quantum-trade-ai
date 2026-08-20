@@ -1,0 +1,23 @@
+version: "3.9"
+services:
+  ml-service:
+    build: ./ml-service
+    ports:
+      - "8000:8000"
+
+  backend:
+    build: ./backend
+    ports:
+      - "5000:3001"
+    env_file: ./backend/.env
+    environment:
+      ML_SERVICE_URL: http://ml-service:8000
+    depends_on:
+      - ml-service
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
