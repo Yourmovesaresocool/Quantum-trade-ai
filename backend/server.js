@@ -1,22 +1,19 @@
 /*
- * QUANTUM TRADE BACKEND SERVER.JS — v6
+ * QUANTUM TRADE BACKEND SERVER.JS — v6.1
  *
- * CHANGE FROM v5: predictions are now actually logged and scoreable.
- *
- *   - predictions table gains a UNIQUE(symbol, timestamp) index, and is
- *     now auto-created (IF NOT EXISTS) like users/trades, in case a
- *     fresh DB never ran upload_to_db.py's schema.
- *   - POST /api/predict now writes each forecast into predictions
- *     (upserted on symbol+timestamp, so re-running analysis on the same
- *     day updates the existing row instead of duplicating it) — it never
- *     fails the actual prediction response if the logging write fails.
- *   - NEW: GET /api/predictions/accuracy/:symbol — joins logged
- *     predictions against the actual close once the daily price sync
- *     has caught up to that date, returning average % error and
- *     direction accuracy (did the model correctly call up vs down).
+ * CHANGE FROM v6: Winston no longer writes to disk when running on
+ * Vercel. Vercel's serverless functions have a read-only filesystem
+ * (except /tmp) — fs.mkdirSync('logs') and the File transports below
+ * threw on every single cold start, crashing the function before
+ * Express even finished setting up. That's what FUNCTION_INVOCATION_FAILED
+ * on /api/health was. process.env.VERCEL is set automatically by
+ * Vercel's runtime, so this needs no manual config — locally and in
+ * Docker (writable filesystem) file logging still works exactly as
+ * before.
  *
  * Everything else (auth, real per-user trading, portfolio, logging,
- * LSTM bars-based /predict, crypto removal) is unchanged from v5.
+ * LSTM bars-based /predict, crypto removal, predictions/accuracy) is
+ * unchanged from v6.
  */
 
 const express = require('express');
@@ -50,16 +47,18 @@ const JWT_EXPIRES_IN = '7d';
 const ML_SERVICE_URL = process.env.ML_SERVICE_URL || 'http://localhost:8000';
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || 'http://localhost:3000';
 const MIN_BARS_REQUIRED = 130; // 90-day sequence + 40-day indicator warmup
-// Starting virtual cash for every new account. $100k gives users enough
-// room to hold several positions at once without constantly running out
-// of buying power — $10k was tight once someone owned 3-4 stocks.
 const DEFAULT_STARTING_BALANCE = 100000;
 
 // ============================================
-// LOGGING (winston + morgan)
+// LOGGING (winston + morgan) — serverless-safe
 // ============================================
 
-if (!fs.existsSync('logs')) fs.mkdirSync('logs');
+// Vercel sets this automatically; true means "read-only filesystem,
+// console-only logging". Locally and inside your Docker container this
+// is undefined/false, so file logging still works there unchanged.
+const isServerless = !!process.env.VERCEL;
+
+if (!isServerless && !fs.existsSync('logs')) fs.mkdirSync('logs');
 
 const logger = winston.createLogger({
   level: 'info',
@@ -69,11 +68,15 @@ const logger = winston.createLogger({
     winston.format.json()
   ),
   transports: [
-    new winston.transports.File({ filename: 'logs/error.log', level: 'error' }),
-    new winston.transports.File({ filename: 'logs/combined.log' }),
     new winston.transports.Console({
       format: winston.format.combine(winston.format.colorize(), winston.format.simple()),
     }),
+    ...(isServerless
+      ? []
+      : [
+          new winston.transports.File({ filename: 'logs/error.log', level: 'error' }),
+          new winston.transports.File({ filename: 'logs/combined.log' }),
+        ]),
   ],
 });
 
@@ -94,8 +97,6 @@ pool.query('SELECT NOW()', (err, res) => {
   }
 });
 
-// Auto-migrate: create/extend tables so upgrading between versions
-// doesn't need manual SQL. Safe to run every startup — all IF NOT EXISTS.
 async function ensureSchema() {
   try {
     await pool.query(`
@@ -108,7 +109,6 @@ async function ensureSchema() {
         created_at TIMESTAMP DEFAULT NOW()
       );
     `);
-    // In case users table already existed from an earlier version without these columns:
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS balance DECIMAL(14,2) NOT NULL DEFAULT ${DEFAULT_STARTING_BALANCE};`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS initial_balance DECIMAL(14,2) NOT NULL DEFAULT ${DEFAULT_STARTING_BALANCE};`);
 
@@ -124,16 +124,10 @@ async function ensureSchema() {
         profit_loss DECIMAL(12,2)
       );
     `);
-    // In case trades table already existed from before without user_id,
-    // or without a default on timestamp (the source of the "1/1/1970"
-    // trade-history bug — CREATE TABLE IF NOT EXISTS alone can't fix a
-    // column default on a table that already existed).
     await pool.query(`ALTER TABLE trades ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id);`);
     await pool.query(`ALTER TABLE trades ALTER COLUMN timestamp SET DEFAULT NOW();`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_trades_user_symbol ON trades(user_id, symbol);`);
 
-    // predictions: logs every AI forecast so it can be scored later
-    // against the actual close once the daily price sync catches up.
     await pool.query(`
       CREATE TABLE IF NOT EXISTS predictions (
         id SERIAL PRIMARY KEY,
@@ -144,8 +138,6 @@ async function ensureSchema() {
         created_at TIMESTAMP DEFAULT NOW()
       );
     `);
-    // One prediction per symbol per predicted day — re-running analysis
-    // the same day updates the existing forecast instead of duplicating it.
     await pool.query(`
       CREATE UNIQUE INDEX IF NOT EXISTS idx_predictions_symbol_ts
       ON predictions(symbol, timestamp);
@@ -222,21 +214,11 @@ function requireAuth(req, res, next) {
 }
 
 // ============================================
-// HELPER FUNCTIONS (for /api/trade signal logic — unchanged)
+// HELPER FUNCTIONS
 // ============================================
 
-// ============================================
-// HELPER FUNCTIONS (for /api/trade signal logic)
-// ============================================
-
-// calculateVolatility and calculateTrend now live in utils/marketMath.js —
-// pulled out specifically so they're unit-testable without spinning up
-// Express or touching Postgres. See backend/tests/marketMath.test.js.
 const { calculateVolatility, calculateTrend } = require('./utils/marketMath');
 
-// Weighted-average cost basis for a user's current holdings in a symbol,
-// computed from their own trade history (BUY adds shares+cost, SELL
-// reduces shares proportionally — matches standard brokerage accounting).
 async function getHoldingsAndAvgCost(userId, symbol) {
   const result = await pool.query(
     `SELECT action, price, quantity FROM trades WHERE user_id = $1 AND symbol = $2 ORDER BY timestamp ASC`,
@@ -438,14 +420,6 @@ app.post(
         { timeout: 10000 }
       );
 
-      // Log this forecast so it can be scored later against the actual
-      // close once the daily price sync reaches that date. result.rows[0]
-      // is the most recent bar (rows are DESC-ordered before the .reverse()
-      // into `bars` above) — the prediction is for the next trading day
-      // after that. Upserted on (symbol, timestamp): re-running analysis
-      // for a symbol already predicted today just updates that row rather
-      // than creating a duplicate. Logging failure never blocks the
-      // response — the person still gets their forecast either way.
       try {
         const predictionDate = new Date(result.rows[0].timestamp);
         predictionDate.setDate(predictionDate.getDate() + 1);
@@ -532,10 +506,6 @@ app.post(
   })
 );
 
-// Predicted-vs-actual track record for a symbol. Only predictions whose
-// target date already has an actual close in historical_prices show up
-// here — a prediction made for tomorrow won't appear until the daily
-// sync inserts tomorrow's real close.
 app.get(
   '/api/predictions/accuracy/:symbol',
   requireAuth,
@@ -598,8 +568,6 @@ app.get(
 // PROTECTED ENDPOINTS — REAL TRADING (persisted per-user)
 // ============================================
 
-// The actual buy/sell endpoint. Price comes from the DB, never the
-// client — a client-supplied price would let someone fake profits.
 app.post(
   '/api/trade/execute',
   requireAuth,
@@ -645,7 +613,6 @@ app.post(
       }
       newBalance = currentBalance - cost;
     } else {
-      // SELL
       if (qty > currentShares) {
         throw new AppError(
           `Insufficient shares: trying to sell ${qty}, hold ${currentShares.toFixed(4)}`,
@@ -657,8 +624,6 @@ app.post(
       newBalance = currentBalance + revenue;
     }
 
-    // Update balance and insert the trade in one transaction so they
-    // can't drift apart if something fails mid-way.
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -687,8 +652,6 @@ app.post(
   })
 );
 
-// All trades for the logged-in user, across every symbol — used to
-// populate the History tab.
 app.get(
   '/api/trades',
   requireAuth,
@@ -714,8 +677,6 @@ app.get(
   })
 );
 
-// Full portfolio snapshot for the logged-in user: cash balance, every
-// held symbol with live value and P/L, and the total account value.
 app.get(
   '/api/portfolio',
   requireAuth,
@@ -824,12 +785,6 @@ app.use((err, req, res, next) => {
 // SERVER STARTUP
 // ============================================
 
-// require.main === module is true when this file is run directly
-// (`node server.js` — exactly what the Docker CMD and local dev both do),
-// and false when it's require()'d by something else (test files via
-// supertest). The previous `NODE_ENV !== 'production'` guard meant the
-// server would never call listen() inside the Docker container, since
-// the Dockerfile sets NODE_ENV=production — this fixes that too.
 if (require.main === module) {
   app.listen(PORT, () => {
     logger.info('='.repeat(60));
