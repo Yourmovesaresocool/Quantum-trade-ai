@@ -417,7 +417,7 @@ app.post(
       const mlResponse = await axios.post(
         `${ML_SERVICE_URL}/predict`,
         { symbol, bars },
-        { timeout: 10000 }
+        { timeout: 25000 }
       );
 
       try {
